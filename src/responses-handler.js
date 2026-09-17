@@ -15,7 +15,6 @@ const {
   buildToolKindMap,
   extractResponsesToolCalls,
   stripToolCallXml,
-  extractBalancedJson,
 } = require('./openai-format');
 const trafficLogger = require('./traffic-logger');
 
@@ -59,7 +58,7 @@ function makeHandler(deps) {
         const tip = buildResponsesToolPrompt(tools);
         if (tip) {
           messages.push({ role: 'system', content: tip });
-          console.log(`[responses ${reqId}] injected tool prompt for ${toolCount} tools`);
+          console.log(`[responses ${reqId}] injected tool prompt for ${toolCount} tools names=${(tools || []).map(t => t.name || t.function?.name || t.type).filter(Boolean).join(',')}`);
         }
       }
       const modelName = model || 'auto';
@@ -190,6 +189,16 @@ async function streamResponse(req, res, ctx) {
   sendEvent('response.created', {
     response: { id: respId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: modelName, status: 'in_progress', output: [] },
   });
+  // Keepalive so Codex doesn't treat a buffered tool turn as a hang
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded || failed) { clearInterval(heartbeat); return; }
+    try {
+      sendEvent('response.in_progress', {
+        response: { id: respId, object: 'response', status: 'in_progress', output: [] },
+      });
+    } catch (_) {}
+  }, 10000);
+  const clearHeartbeat = () => { try { clearInterval(heartbeat); } catch (_) {} };
   let fullContent = '';
   let fullReasoning = '';
   let tokenUsage = null;
@@ -198,8 +207,8 @@ async function streamResponse(req, res, ctx) {
   const nativeToolCalls = [];
   let upstreamChunks = 0;
   let upstreamBytes = 0;
-  // Hold back only from an open <tool_call ... so Codex never sees raw XML,
-  // but still stream normal text immediately (avoids "stuck" with no SSE).
+  // With tools: buffer ALL text until done, then emit clean message + function_call.
+  // Streaming partial tool XML/JSON makes Codex display it as chat text.
   let toolTagHold = '';
   const startMessageItem = (outputIndex, text) => {
     if (messageItemSent) return;
@@ -233,7 +242,6 @@ async function streamResponse(req, res, ctx) {
       const argsStr = JSON.stringify(argsObj);
 
       if (kind === 'custom') {
-        // Codex freeform/custom tools expect custom_tool_call + input (string)
         const ctcId = `ctc_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
         const item = {
           type: 'custom_tool_call',
@@ -241,10 +249,9 @@ async function streamResponse(req, res, ctx) {
           call_id: callId,
           name: tc.name,
           input: argsStr,
-          status: 'in_progress',
         };
         console.log(`[${tag}] custom_tool_call name=${tc.name} input=${argsStr.slice(0, 200)}`);
-        sendEvent('response.output_item.added', { output_index: idx, item });
+        sendEvent('response.output_item.added', { output_index: idx, item: { ...item, status: 'in_progress' } });
         sendEvent('response.custom_tool_call_input.delta', { item_id: ctcId, output_index: idx, delta: argsStr });
         sendEvent('response.custom_tool_call_input.done', { item_id: ctcId, output_index: idx, input: argsStr });
         const doneItem = { ...item, status: 'completed' };
@@ -252,121 +259,57 @@ async function streamResponse(req, res, ctx) {
         items.push(doneItem);
       } else {
         const fcId = `fc_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
+        // Match Codex ResponseItem::FunctionCall wire shape (no status field required)
         const item = {
           type: 'function_call',
           id: fcId,
           call_id: callId,
           name: tc.name,
           arguments: argsStr,
-          status: 'in_progress',
         };
         console.log(`[${tag}] function_call name=${tc.name} args=${argsStr.slice(0, 200)}`);
         sendEvent('response.output_item.added', { output_index: idx, item });
         sendEvent('response.function_call_arguments.delta', { item_id: fcId, output_index: idx, delta: argsStr });
         sendEvent('response.function_call_arguments.done', { item_id: fcId, output_index: idx, arguments: argsStr });
-        const doneItem = { ...item, status: 'completed' };
-        sendEvent('response.output_item.done', { output_index: idx, item: doneItem });
-        items.push(doneItem);
+        sendEvent('response.output_item.done', { output_index: idx, item });
+        items.push(item);
       }
       idx += 1;
     }
     return { items, nextIndex: idx };
   };
-  /** Stream safe text; park incomplete/complete tool-call blocks so Codex never sees raw XML. */
+  /** Accumulate model text; only stream live when tools are disabled. */
   const pushTextDelta = (piece) => {
     if (!piece) return;
     fullContent += piece;
-    if (!toolsEnabled) {
-      startMessageItem(0);
-      sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: piece });
-      return;
-    }
-    toolTagHold += piece;
-    while (toolTagHold.length) {
-      const startXml = toolTagHold.search(/<tool_?call\b/i);
-      const startHdr = toolTagHold.search(/\[function_call\s+name=/i);
-      let start = -1;
-      let mode = null;
-      if (startXml >= 0 && (startHdr < 0 || startXml <= startHdr)) { start = startXml; mode = 'xml'; }
-      else if (startHdr >= 0) { start = startHdr; mode = 'hdr'; }
-
-      if (start === -1) {
-        const partial = toolTagHold.match(/<(?:t(?:o(?:o(?:l(?:_?(?:c(?:a(?:l(?:l)?)?)?)?)?)?)?)?)?$|\[(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n(?:_(?:c(?:a(?:l(?:l)?)?)?)?)?)?)?)?)?)?)?)?)?$/i);
-        if (partial) {
-          const safe = toolTagHold.slice(0, partial.index);
-          toolTagHold = toolTagHold.slice(partial.index);
-          if (safe) {
-            startMessageItem(0);
-            sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: safe });
-          }
-        } else {
-          startMessageItem(0);
-          sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: toolTagHold });
-          toolTagHold = '';
-        }
-        break;
-      }
-      if (start > 0) {
-        const before = toolTagHold.slice(0, start);
-        startMessageItem(0);
-        sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: before });
-        toolTagHold = toolTagHold.slice(start);
-      }
-      // toolTagHold now starts with tool marker
-      if (mode === 'xml') {
-        const open = toolTagHold.match(/^<tool_?call\b[^>]*>/i);
-        if (!open) break;
-        const endClose = toolTagHold.match(/<\/tool_?call\s*>/i);
-        const bal = extractBalancedJson(toolTagHold, open[0].length);
-        if (endClose) {
-          toolTagHold = toolTagHold.slice(endClose.index + endClose[0].length);
-          continue;
-        }
-        if (bal) {
-          // complete JSON without closing tag — drop the tool call from visible stream
-          toolTagHold = toolTagHold.slice(bal.end);
-          continue;
-        }
-        break; // wait for more
-      }
-      // header mode
-      const hdr = toolTagHold.match(/^\[function_call\s+name=[^\]]+\]/i);
-      if (!hdr) break;
-      const bal = extractBalancedJson(toolTagHold, hdr[0].length);
-      if (bal) {
-        toolTagHold = toolTagHold.slice(bal.end);
-        continue;
-      }
-      break;
-    }
+    if (toolsEnabled) return; // buffer — emit only after parse at finalize
+    startMessageItem(0);
+    sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: piece });
   };
   const finalize = (logId) => {
-    // Do NOT flush leftover <tool_call> / [function_call holds as visible text
-    if (toolTagHold && !/^<tool_?call\b/i.test(toolTagHold) && !/^\[function_call\s+name=/i.test(toolTagHold)) {
-      startMessageItem(0);
-      sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: toolTagHold });
-      toolTagHold = '';
-    } else {
-      toolTagHold = '';
-    }
+    clearHeartbeat();
+    toolTagHold = '';
     const calls = extractResponsesToolCalls(fullContent, nativeToolCalls, knownToolNames);
     const cleanText = stripToolCallXml(fullContent);
     if (toolsEnabled && !calls.length && fullContent.trim()) {
-      console.warn(`[${tag}] tools enabled but no tool_call parsed; raw preview=${JSON.stringify(fullContent.slice(0, 400))}`);
+      console.warn(`[${tag}] tools enabled but no tool_call parsed; raw preview=${JSON.stringify(fullContent.slice(0, 500))}`);
     }
     fullContent = cleanText;
     let outputIndex = 0;
     const extraOutput = [];
     const messageText = cleanText;
-    if (calls.length && !String(messageText || '').trim()) {
-      if (messageItemSent) outputIndex = flushMessageItem(0, '');
-    } else if (messageItemSent || messageText) {
-      outputIndex = flushMessageItem(0, messageText || '');
-    }
+    // Prefer tool calls: if we have calls, only emit leftover non-empty prose as message
     if (calls.length) {
+      if (messageText && messageText.trim()) {
+        outputIndex = flushMessageItem(0, messageText);
+      } else if (messageItemSent) {
+        outputIndex = flushMessageItem(0, '');
+      }
       const { items, nextIndex } = emitFunctionCalls(outputIndex, calls);
       extraOutput.push(...items);
       outputIndex = nextIndex;
+    } else if (messageItemSent || messageText) {
+      outputIndex = flushMessageItem(0, messageText || '');
     }
     const usage = tokenUsage ? {
       input_tokens: tokenUsage.prompt_tokens || 0,
@@ -375,11 +318,12 @@ async function streamResponse(req, res, ctx) {
     } : undefined;
     console.log(`[${tag}] complete content_len=${messageText.length} tools=${calls.length} upstream_chunks=${upstreamChunks} events=${eventCount}`);
     sendEvent('response.completed', {
-      response: createResponsesResponse(respId, modelName, messageText, fullReasoning, usage, 'completed', extraOutput),
+      response: createResponsesResponse(respId, modelName, calls.length ? messageText : messageText, fullReasoning, usage, 'completed', extraOutput),
     });
     if (logId) trafficLogger.finalizeLog(logId, { fullContent: messageText, fullReasoning, tokenUsage, toolCalls: calls });
   };
   const endStream = () => {
+    clearHeartbeat();
     if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
   };
   try {
