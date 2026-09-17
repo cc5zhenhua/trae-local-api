@@ -9,6 +9,8 @@ const PACKAGE_VERSION = require('../package.json').version;
 const { getAuthInfo, getDeviceIds, isTokenExpired, getApiHost, refreshTokenIfNeeded, detectEdition } = require('./auth');
 const { llmUtilsChat, chatCompletion, createAgentTask, getModelDetailParam, getChatModes, resolveModelId, MODEL_MAP, REVERSE_MODEL_MAP, FUNCTION_MAP, getFallbackConfig, saveFallbackConfig, getFallbackChain, getRaceModels, isRaceFallbackEnabled, getTiers, getModelsInTier, getTierOfModel, isTieredFallbackEnabled, isRaceWithinTierEnabled, getFallbackModel, getSameTierModels, getNextTierModels, findMultimodalModel, getModelConfig, saveModelConfig, rebuildDerivedMaps } = require('./trae-client');
 const { createOpenAIChatCompletion, createOpenAIStreamChunk, createOpenAIModels, parseLlmUtilsChatStream, llmUtilsChunkToOpenAI, parseAgentTaskStream, parseTraeStreamChunk, traeChunkToOpenAI } = require('./openai-format');
+const { createResponsesResponse, createResponsesStreamEvent, createResponsesTextDeltaEvent, responsesInputToMessages } = require('./openai-format');
+const createResponsesHandler = require('./responses-handler');
 const {
   createAnthropicMessage,
   createAnthropicMessageStart,
@@ -689,6 +691,18 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
   }
 });
 
+// ==================== OpenAI Responses API Endpoint ====================
+// POST /v1/responses - OpenAI Responses API compatible endpoint
+const responsesHandler = createResponsesHandler({
+  responsesInputToMessages,
+  resolveModelId, MODEL_MAP, findMultimodalModel,
+  refreshTokenIfNeeded, isTokenExpired,
+  llmUtilsChat, chatCompletion, createAgentTask,
+  parseLlmUtilsChatStream, parseAgentTaskStream, parseTraeStreamChunk,
+  sessionsRepo, extractWorkspace, WORKSPACE_DIR, syncFileToOutput,
+});
+app.post('/v1/responses', authenticate, (req, res) => responsesHandler(req, res));
+
 app.get('/v1/status', authenticate, async (req, res) => {
   try {
     const authInfo = await refreshTokenIfNeeded();
@@ -976,6 +990,7 @@ app.get('/v1/info', authenticate, (req, res) => {
       models_detail: 'GET /v1/models/detail?function=chat_v3',
       chat_modes: 'GET /v1/chat/modes',
       anthropic: 'POST /v1/messages',
+      responses: 'POST /v1/responses',
       files: 'GET /v1/files',
       files_read: 'GET /v1/files/read?path=xxx',
       status: 'GET /v1/status',
@@ -2185,9 +2200,10 @@ app.put('/v1/config/defaults', authenticate, (req, res) => {
 app.listen(PORT, () => {
   console.log(`\n[Trae Local API] Server running on http://localhost:${PORT}`);
   console.log(`[Trae Local API] API Key: ${API_KEY.substring(0, 8)}${API_KEY.length > 8 ? '***' : ''}`);
-  console.log(`[Trae Local API] OpenAI endpoint: http://localhost:${PORT}/v1/chat/completions`);
-  console.log(`[Trae Local API] Anthropic endpoint: http://localhost:${PORT}/v1/messages`);
-  console.log(`[Trae Local API] Agent tools: read_file, write_file, list_files, search_internet, fetch_url, execute_command`);
+ console.log(`[Trae Local API] OpenAI endpoint: http://localhost:${PORT}/v1/chat/completions`);
+ console.log(`[Trae Local API] Anthropic endpoint: http://localhost:${PORT}/v1/messages`);
+  console.log(`[Trae Local API] Responses endpoint: http://localhost:${PORT}/v1/responses`);
+ console.log(`[Trae Local API] Agent tools: read_file, write_file, list_files, search_internet, fetch_url, execute_command`);
   console.log(`[Trae Local API] Workspace dir: ${WORKSPACE_DIR || 'not set'}`);
   console.log(`[Trae Local API] Auto-continue: ${AUTO_CONTINUE ? `enabled (max ${MAX_CONTINUES})` : 'disabled'}`);
   if (OUTPUT_SYNC_DIR) {

@@ -368,10 +368,135 @@ function normalizeAgentTaskChunk(chunk) {
   return chunk;
 }
 
+// ==================== OpenAI Responses API (v1/responses) ====================
+
+/**
+ * Convert Responses API `input` field to OpenAI Chat messages.
+ * Accepts either an array of messages/items or a plain string.
+ * Supports both Chat-style message objects and Responses `response.output_item` shapes.
+ */
+function responsesInputToMessages(input, instructions) {
+  let messages = [];
+
+  if (instructions) {
+    messages.push({ role: 'system', content: instructions });
+  }
+
+  if (input == null) {
+    return messages;
+  }
+
+  if (typeof input === 'string') {
+    messages.push({ role: 'user', content: input });
+    return messages;
+  }
+
+  if (!Array.isArray(input)) {
+    messages.push({ role: 'user', content: JSON.stringify(input) });
+    return messages;
+  }
+
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+
+    // Already a chat-style message: { role, content }
+    if (item.role && item.content !== undefined) {
+      messages.push(item);
+      continue;
+    }
+
+    // Responses output_item shape: { type: 'message', role, content: [{type:'output_text'|'input_text', text}] }
+    if (item.type === 'message' && item.role) {
+      let text = '';
+      if (Array.isArray(item.content)) {
+        text = item.content
+          .map(c => (typeof c === 'string' ? c : (c.text || c.content || '')))
+          .join('');
+      } else if (typeof item.content === 'string') {
+        text = item.content;
+      }
+      messages.push({ role: item.role, content: text });
+      continue;
+    }
+
+    // Responses input_text item: { type: 'input_text'|'input_image', ... }
+    if (item.type === 'input_text') {
+      messages.push({ role: item.role || 'user', content: item.text || '' });
+      continue;
+    }
+    if (item.type === 'input_image') {
+      const content = item.image_url || item.url || '';
+      messages.push({ role: item.role || 'user', content: [{ type: 'image_url', image_url: { url: content } }] });
+      continue;
+    }
+
+    // Fallback: try role/content
+    if (item.role) {
+      messages.push({ role: item.role, content: item.content || item.text || '' });
+    }
+  }
+
+  return messages;
+}
+
+/**
+ * Build a non-streaming Responses API response object.
+ */
+function createResponsesResponse(id, model, content, reasoning, usage, status) {
+  const text = content || '';
+  const respId = id || `resp_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
+  return {
+    id: respId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    model: model,
+    status: status || 'completed',
+    output: [{
+      type: 'message',
+      id: `msg_${uuidv4().replace(/-/g, '').substring(0, 24)}`,
+      status: status || 'completed',
+      role: 'assistant',
+      content: [
+        ...(reasoning ? [{ type: 'reasoning', text: reasoning }] : []),
+        { type: 'output_text', text: text }
+      ]
+    }],
+    usage: usage || {
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0
+    }
+  };
+}
+
+/**
+ * Build a generic Responses API streaming event.
+ */
+function createResponsesStreamEvent(type, data) {
+  return { type, ...(data || {}) };
+}
+
+/**
+ * Build a response.output_text.delta streaming event.
+ */
+function createResponsesTextDeltaEvent(itemId, contentIndex, delta) {
+  return {
+    type: 'response.output_text.delta',
+    item_id: itemId,
+    output_index: 0,
+    content_index: contentIndex || 0,
+    delta: delta || ''
+  };
+}
+
 module.exports = {
   createOpenAIChatCompletion,
   createOpenAIStreamChunk,
   createOpenAIModels,
+  createResponsesResponse,
+  createResponsesStreamEvent,
+  createResponsesTextDeltaEvent,
+  responsesInputToMessages,
   parseLlmUtilsChatSSE,
   parseLlmUtilsChatStream,
   normalizeLlmUtilsChunk,
