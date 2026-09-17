@@ -29,22 +29,34 @@ function makeHandler(deps) {
   return async function responsesHandler(req, res) {
     const reqId = uuidv4().substring(0, 8);
     try {
+      const body = req.body || {};
       const {
         input, model, instructions, stream,
         function: funcName, config_name, workspace_dir, save_to, previous_response_id,
-      } = req.body || {};
+      } = body;
+      const tools = body.tools;
+      const toolCount = Array.isArray(tools) ? tools.length : 0;
+      const inputKind = input == null ? 'null' : Array.isArray(input) ? `array[${input.length}]` : typeof input;
+      console.log(`[responses ${reqId}] POST /v1/responses ua=${req.headers['user-agent'] || '-'} keys=${Object.keys(body).join(',')}`);
+      console.log(`[responses ${reqId}] model=${model || 'auto'} stream=${stream !== false} input=${inputKind} tools=${toolCount} instructions_len=${(instructions && String(instructions).length) || 0} prev=${previous_response_id || 'none'}`);
       if (input === undefined) {
+        console.error(`[responses ${reqId}] REJECT 400: input is required`);
         return res.status(400).json({ error: { message: 'input is required', type: 'invalid_request_error' } });
       }
       const messages = responsesInputToMessages(input, instructions);
       if (messages.length === 0) {
+        console.error(`[responses ${reqId}] REJECT 400: input resolved to no messages`);
         return res.status(400).json({ error: { message: 'input resolved to no messages', type: 'invalid_request_error' } });
       }
       const modelName = model || 'auto';
       const isStream = stream !== false;
       const respId = `resp_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
       const msgId = `msg_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
-      console.log(`[responses ${reqId}] POST /v1/responses model=${modelName} stream=${isStream} messages=${messages.length} instructions=${!!instructions} prev=${previous_response_id || 'none'}`);
+      const lastUser = [...messages].reverse().find(m => m && m.role === 'user');
+      const preview = lastUser && lastUser.content != null
+        ? String(typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content)).slice(0, 120)
+        : '';
+      console.log(`[responses ${reqId}] messages=${messages.length} roles=${messages.map(m => m.role).join('>')} preview=${JSON.stringify(preview)}`);
       let saveToPath = null;
       if (save_to) {
         const wsDir = workspace_dir || WORKSPACE_DIR;
@@ -55,6 +67,7 @@ function makeHandler(deps) {
       const persistAssistant = buildPersist(req, sessionId => sessionId, messages, sessionsRepo);
       const authInfo = await refreshTokenIfNeeded();
       if (isTokenExpired(authInfo)) {
+        console.error(`[responses ${reqId}] REJECT 401: Trae token expired`);
         return res.status(401).json({ error: { message: 'Trae token expired. Please restart Trae IDE to refresh.', type: 'auth_error' } });
       }
       const options = {};
@@ -63,7 +76,7 @@ function makeHandler(deps) {
       if (workspace_dir) options.workspace_dir = workspace_dir;
       options.workspace = extractWorkspace(req);
       for (const key of ['temperature', 'top_p', 'max_tokens', 'presence_penalty', 'frequency_penalty', 'stop', 'seed', 'n']) {
-        if (req.body[key] !== undefined) options[key] = req.body[key];
+        if (body[key] !== undefined) options[key] = body[key];
       }
       const hasImageContent = messages.some(m => Array.isArray(m.content) && m.content.some(c => c.type === 'image' || c.type === 'image_url'));
       if (hasImageContent) {
@@ -77,11 +90,11 @@ function makeHandler(deps) {
           }
         }
       }
-      const baseCtx = { respId, msgId, modelName, messages, options, persistAssistant, saveToPath, llmUtilsChat, chatCompletion, createAgentTask, parseLlmUtilsChatStream, parseAgentTaskStream, parseTraeStreamChunk, syncFileToOutput };
+      const baseCtx = { reqId, respId, msgId, modelName, messages, options, persistAssistant, saveToPath, llmUtilsChat, chatCompletion, createAgentTask, parseLlmUtilsChatStream, parseAgentTaskStream, parseTraeStreamChunk, syncFileToOutput };
       if (isStream) await streamResponse(req, res, baseCtx);
       else await nonStreamResponse(res, baseCtx);
     } catch (err) {
-      console.error('Responses API error:', err);
+      console.error(`[responses ${reqId}] FATAL:`, err);
       res.status(500).json({ error: { message: err.message, type: 'internal_error' } });
     }
   };
@@ -116,17 +129,42 @@ function buildPersist(req, _id, messages, sessionsRepo) {
 
 async function streamResponse(req, res, ctx) {
   const {
-    respId, msgId, modelName, messages, options, persistAssistant, saveToPath,
+    reqId, respId, msgId, modelName, messages, options, persistAssistant, saveToPath,
     llmUtilsChat, chatCompletion, parseLlmUtilsChatStream, parseAgentTaskStream, parseTraeStreamChunk, syncFileToOutput,
   } = ctx;
+  const tag = `responses ${reqId || respId}`;
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
+  let eventCount = 0;
+  let failed = false;
   const sendEvent = (eventType, data) => {
-    if (res.writableEnded) return;
+    if (res.writableEnded) {
+      console.warn(`[${tag}] skip write (ended): ${eventType}`);
+      return;
+    }
+    eventCount += 1;
+    if (eventType === 'response.failed' || eventType === 'response.completed' || eventCount <= 3) {
+      console.log(`[${tag}] SSE #${eventCount} ${eventType}`);
+    }
     res.write('event: ' + eventType + '\n');
     res.write('data: ' + JSON.stringify({ type: eventType, ...(data || {}) }) + '\n\n');
+  };
+  const failStream = (source, message, extra) => {
+    if (failed || res.writableEnded) return;
+    failed = true;
+    const msg = message || 'unknown error';
+    console.error(`[${tag}] response.failed source=${source} message=${msg}`, extra || '');
+    sendEvent('response.failed', {
+      response: {
+        id: respId,
+        object: 'response',
+        status: 'failed',
+        error: { message: msg, code: extra && extra.code, source },
+      },
+    });
+    endStream();
   };
   sendEvent('response.created', {
     response: { id: respId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: modelName, status: 'in_progress', output: [] },
@@ -135,6 +173,7 @@ async function streamResponse(req, res, ctx) {
   let fullReasoning = '';
   let tokenUsage = null;
   let messageItemSent = false;
+  let clientClosed = false;
   const startMessageItem = () => {
     if (messageItemSent) return;
     messageItemSent = true;
@@ -154,6 +193,7 @@ async function streamResponse(req, res, ctx) {
       output_tokens: tokenUsage.completion_tokens || 0,
       total_tokens: tokenUsage.total_tokens || 0,
     } : undefined;
+    console.log(`[${tag}] complete content_len=${fullContent.length} reasoning_len=${fullReasoning.length} events=${eventCount}`);
     sendEvent('response.completed', { response: createResponsesResponse(respId, modelName, fullContent, fullReasoning, usage, 'completed') });
     if (logId) trafficLogger.finalizeLog(logId, { fullContent, fullReasoning, tokenUsage });
   };
@@ -161,8 +201,10 @@ async function streamResponse(req, res, ctx) {
     if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
   };
   try {
+    console.log(`[${tag}] calling llmUtilsChat model=${modelName}`);
     const result = await llmUtilsChat(messages, modelName, true, options);
     const logId = result.logId;
+    console.log(`[${tag}] llmUtilsChat ok logId=${logId || '-'} hasBody=${!!result.body}`);
     if (result.body) {
       let buffer = '';
       let currentEventName = '';
@@ -188,6 +230,7 @@ async function streamResponse(req, res, ctx) {
               continue;
             }
             if (parsed.type === 'done') {
+              if (failed || res.writableEnded) return;
               if (persistAssistant) {
                 try { persistAssistant(fullContent, fullReasoning, tokenUsage); }
                 catch (e) { console.error('[persist] assistant (responses stream done) failed:', e); }
@@ -214,27 +257,26 @@ async function streamResponse(req, res, ctx) {
                 sendEvent('response.output_text.delta', { item_id: msgId, output_index: 0, content_index: 0, delta: parsed.content });
               }
               if (parsed.reasoning) {
-                startMessageItem();
+                // Accumulate only — do not emit non-standard response.reasoning.delta
+                // (Codex/OpenAI Responses clients reject it and may surface response.failed).
                 fullReasoning += parsed.reasoning;
                 if (logId) trafficLogger.logResponseContent(logId, null, parsed.reasoning);
-                sendEvent('response.reasoning.delta', { item_id: msgId, output_index: 0, content_index: 1, delta: parsed.reasoning });
               }
             }
             if (parsed.type === 'error') {
-              sendEvent('response.failed', { response: { id: respId, object: 'response', status: 'failed', error: { message: parsed.message || 'unknown error', code: parsed.code } } });
-              endStream();
+              failStream('upstream_sse_error', parsed.message || 'unknown error', { code: parsed.code, raw: parsed });
             }
           }
         } catch (err) {
-          console.error('[responses stream] Error in data callback:', err);
+          console.error(`[${tag}] Error in data callback:`, err);
           if (logId) trafficLogger.logError(logId, err);
           try { result.body.destroy(); } catch (e) {}
-          sendEvent('response.failed', { response: { id: respId, object: 'response', status: 'failed', error: { message: err.message } } });
-          endStream();
+          failStream('data_callback', err.message);
         }
       });
       result.body.on('end', () => {
-        if (!res.writableEnded) {
+        if (!res.writableEnded && !failed) {
+          console.log(`[${tag}] upstream body end (no done event), content_len=${fullContent.length}`);
           if (persistAssistant) {
             try { persistAssistant(fullContent, fullReasoning, tokenUsage); }
             catch (e) { console.error('[persist] assistant (responses stream end) failed:', e); }
@@ -244,14 +286,19 @@ async function streamResponse(req, res, ctx) {
         }
       });
       result.body.on('error', (err) => {
-        console.error('[responses stream] upstream error:', err);
-        sendEvent('response.failed', { response: { id: respId, object: 'response', status: 'failed', error: { message: err.message } } });
-        endStream();
+        if (clientClosed) {
+          console.warn(`[${tag}] upstream error after client close: ${err.message}`);
+          return;
+        }
+        failStream('upstream_body_error', err.message);
       });
       req.on('close', () => {
+        clientClosed = true;
+        console.warn(`[${tag}] client closed early content_len=${fullContent.length} events=${eventCount} ended=${res.writableEnded}`);
         if (result.body && result.body.destroy) result.body.destroy();
       });
     } else {
+      console.warn(`[${tag}] empty upstream body`);
       if (persistAssistant) {
         try { persistAssistant('', '', null); } catch (e) { console.error('[persist] assistant (responses empty body) failed:', e); }
       }
@@ -259,7 +306,7 @@ async function streamResponse(req, res, ctx) {
       endStream();
     }
   } catch (llmErr) {
-    console.log(`[responses] llmUtilsChat failed: ${llmErr.message}, falling back to chatCompletion`);
+    console.log(`[${tag}] llmUtilsChat failed: ${llmErr.message}, falling back to chatCompletion`);
     try {
       const responseBody = await chatCompletion(messages, modelName, true, options);
       await new Promise((resolve, reject) => {
@@ -287,8 +334,7 @@ async function streamResponse(req, res, ctx) {
       finalize(null);
       endStream();
     } catch (chatErr) {
-      sendEvent('response.failed', { response: { id: respId, object: 'response', status: 'failed', error: { message: chatErr.message } } });
-      endStream();
+      failStream('fallback_chatCompletion', chatErr.message, { llmErr: llmErr.message });
     }
   }
 }

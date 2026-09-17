@@ -399,44 +399,89 @@ function responsesInputToMessages(input, instructions) {
   for (const item of input) {
     if (!item || typeof item !== 'object') continue;
 
-    // Already a chat-style message: { role, content }
+    // Already a chat-style message: { role, content } (Codex sends this with input_text parts)
     if (item.role && item.content !== undefined) {
-      messages.push(item);
+      messages.push({
+        role: normalizeResponsesRole(item.role),
+        content: normalizeResponsesContent(item.content),
+      });
       continue;
     }
 
     // Responses output_item shape: { type: 'message', role, content: [{type:'output_text'|'input_text', text}] }
     if (item.type === 'message' && item.role) {
-      let text = '';
-      if (Array.isArray(item.content)) {
-        text = item.content
-          .map(c => (typeof c === 'string' ? c : (c.text || c.content || '')))
-          .join('');
-      } else if (typeof item.content === 'string') {
-        text = item.content;
-      }
-      messages.push({ role: item.role, content: text });
+      messages.push({
+        role: normalizeResponsesRole(item.role),
+        content: normalizeResponsesContent(item.content),
+      });
       continue;
     }
 
     // Responses input_text item: { type: 'input_text'|'input_image', ... }
     if (item.type === 'input_text') {
-      messages.push({ role: item.role || 'user', content: item.text || '' });
+      messages.push({ role: normalizeResponsesRole(item.role || 'user'), content: item.text || '' });
       continue;
     }
     if (item.type === 'input_image') {
       const content = item.image_url || item.url || '';
-      messages.push({ role: item.role || 'user', content: [{ type: 'image_url', image_url: { url: content } }] });
+      messages.push({ role: normalizeResponsesRole(item.role || 'user'), content: [{ type: 'image_url', image_url: { url: content } }] });
       continue;
     }
 
     // Fallback: try role/content
     if (item.role) {
-      messages.push({ role: item.role, content: item.content || item.text || '' });
+      messages.push({
+        role: normalizeResponsesRole(item.role),
+        content: normalizeResponsesContent(item.content || item.text || ''),
+      });
     }
   }
 
   return messages;
+}
+
+/** Map OpenAI Responses roles Trae does not accept. */
+function normalizeResponsesRole(role) {
+  if (role === 'developer') return 'system';
+  return role || 'user';
+}
+
+/** Flatten Responses content parts (input_text/output_text) to string or Trae-safe parts. */
+function normalizeResponsesContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content);
+  const texts = [];
+  const parts = [];
+  let hasNonText = false;
+  for (const c of content) {
+    if (typeof c === 'string') {
+      texts.push(c);
+      parts.push({ type: 'text', text: c });
+      continue;
+    }
+    if (!c || typeof c !== 'object') continue;
+    if (c.type === 'input_text' || c.type === 'output_text' || c.type === 'text') {
+      const t = c.text || '';
+      texts.push(t);
+      parts.push({ type: 'text', text: t });
+      continue;
+    }
+    if (c.type === 'image_url' || c.type === 'input_image' || c.type === 'image') {
+      hasNonText = true;
+      if (c.type === 'input_image') {
+        parts.push({ type: 'image_url', image_url: { url: c.image_url || c.url || '' } });
+      } else {
+        parts.push(c);
+      }
+      continue;
+    }
+    if (c.text) {
+      texts.push(c.text);
+      parts.push({ type: 'text', text: c.text });
+    }
+  }
+  return hasNonText ? parts : texts.join('\n');
 }
 
 /**
@@ -456,8 +501,9 @@ function createResponsesResponse(id, model, content, reasoning, usage, status) {
       id: `msg_${uuidv4().replace(/-/g, '').substring(0, 24)}`,
       status: status || 'completed',
       role: 'assistant',
+      // Only output_text in message content (OpenAI/Codex-compatible).
+      // Reasoning is kept server-side via the unused `reasoning` arg / logs.
       content: [
-        ...(reasoning ? [{ type: 'reasoning', text: reasoning }] : []),
         { type: 'output_text', text: text }
       ]
     }],

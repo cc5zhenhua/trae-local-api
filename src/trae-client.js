@@ -210,10 +210,19 @@ rebuildDerivedMaps();
 function resolveModelId(modelName) {
   const lower = modelName.toLowerCase();
   if (MODEL_MAP[lower]) return MODEL_MAP[lower];
+  // Prefer longest key/value match so glm-5.3 does not collapse to glm-5
+  let best = null;
+  let bestLen = 0;
   for (const [key, val] of Object.entries(MODEL_MAP)) {
-    if (lower.includes(key) || lower.includes(val)) return val;
+    for (const candidate of [key, val]) {
+      if (!candidate) continue;
+      if ((lower.includes(candidate) || candidate.includes(lower)) && candidate.length > bestLen) {
+        best = val;
+        bestLen = candidate.length;
+      }
+    }
   }
-  return lower;
+  return best || lower;
 }
 
 function resolveModelOptions(modelName, configNameOverride) {
@@ -227,9 +236,15 @@ function resolveModelOptions(modelName, configNameOverride) {
   if (MODEL_TO_FUNCTION[lower]) {
     return MODEL_TO_FUNCTION[lower];
   }
+  let best = null;
+  let bestLen = 0;
   for (const [key, val] of Object.entries(MODEL_TO_FUNCTION)) {
-    if (lower.includes(key)) return val;
+    if (lower.includes(key) && key.length > bestLen) {
+      best = val;
+      bestLen = key.length;
+    }
   }
+  if (best) return best;
   return { function: 'chat_v3', config_name: modelName };
 }
 
@@ -342,15 +357,19 @@ async function llmUtilsChat(messages, model, stream, options) {
     const modelOpts = resolveModelOptions(model);
     const funcName = options?.function || modelOpts.function || 'inline_chat';
 
-    const traeMessages = messages.map(m => ({
-      role: m.role,
-      content: Array.isArray(m.content)
+    const traeMessages = messages.map(m => {
+      const role = m.role === 'developer' ? 'system' : m.role;
+      const content = Array.isArray(m.content)
         ? m.content.map(c => {
             if (typeof c === 'string') return { type: 'text', text: c };
+            if (c && (c.type === 'input_text' || c.type === 'output_text')) {
+              return { type: 'text', text: c.text || '' };
+            }
             return c;
           })
-        : [{ type: 'text', text: String(m.content || '') }]
-    }));
+        : [{ type: 'text', text: String(m.content || '') }];
+      return { role, content };
+    });
 
     const body = {
       messages: traeMessages,
