@@ -315,6 +315,33 @@
       "reasoning": false,
       "tier": 2
     },
+    "gpt-5": {
+      "function": "chat_v3",
+      "config_name": "glm-5.2",
+      "category": "openai",
+      "toolcall_compatible": true,
+      "multimodal": false,
+      "reasoning": true,
+      "tier": 1
+    },
+    "gpt-5.4": {
+      "function": "chat_v3",
+      "config_name": "glm-5.2",
+      "category": "openai",
+      "toolcall_compatible": true,
+      "multimodal": false,
+      "reasoning": true,
+      "tier": 1
+    },
+    "gpt-5.6-luna": {
+      "function": "chat_v3",
+      "config_name": "glm-5.2",
+      "category": "openai",
+      "toolcall_compatible": true,
+      "multimodal": false,
+      "reasoning": true,
+      "tier": 1
+    },
     "gpt-4o-mini": {
       "function": "chat_v3",
       "config_name": "custom_model_gpt-5",

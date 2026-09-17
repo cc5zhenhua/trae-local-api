@@ -245,7 +245,10 @@ function resolveModelOptions(modelName, configNameOverride) {
     }
   }
   if (best) return best;
-  return { function: 'chat_v3', config_name: modelName };
+  // Never forward unknown Codex/OpenAI model ids to Trae (causes 4001).
+  const fb = (typeof getFallbackModel === 'function' && getFallbackModel()) || 'glm-5.2';
+  console.warn(`[model] unknown "${modelName}" → fallback config_name=${fb}`);
+  return { function: 'chat_v3', config_name: fb };
 }
 
 function getFallbackChain(modelName) {
